@@ -179,7 +179,11 @@ func (p *ProviderAdapter) Subscribe(ctx context.Context, cfg datasource.Subscrip
 		return nil
 	}
 
-	msgChan := make(chan *nats.Msg)
+	// nats.go delivers to channel subscriptions with a non-blocking send and drops
+	// the message as a slow consumer if the channel is full. An unbuffered channel
+	// therefore drops every message that arrives while the loop below is busy.
+	// Buffer it the same way nats.go buffers its own sync subscriptions.
+	msgChan := make(chan *nats.Msg, p.client.Opts.SubChanLen)
 	subscriptions := make([]*nats.Subscription, len(subConf.Subjects))
 	for i, subject := range subConf.Subjects {
 		subscription, err := p.client.ChanSubscribe(subject, msgChan)

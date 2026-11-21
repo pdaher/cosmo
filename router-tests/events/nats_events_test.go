@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/url"
 	"strconv"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -141,6 +142,62 @@ func TestNatsEvents(t *testing.T) {
 			require.Len(t, natsLogs, 2)
 			providerIDFields := xEnv.Observer().FilterField(zap.String("provider_id", "my-nats")).All()
 			require.Len(t, providerIDFields, 3)
+		})
+	})
+
+	t.Run("subscribe async receives every message of a burst", func(t *testing.T) {
+		t.Parallel()
+
+		testenv.Run(t, &testenv.Config{
+			RouterConfigJSONTemplate: testenv.ConfigWithEdfsNatsJSONTemplate,
+			EnableNats:               true,
+		}, func(t *testing.T, xEnv *testenv.Environment) {
+			const messageCount = 1000
+
+			var subscriptionOne struct {
+				employeeUpdated struct {
+					ID float64 `graphql:"id"`
+				} `graphql:"employeeUpdated(employeeID: 3)"`
+			}
+
+			surl := xEnv.GraphQLWebSocketSubscriptionURL()
+			client := graphql.NewSubscriptionClient(surl)
+
+			var received atomic.Int64
+			subscriptionOneID, err := client.Subscribe(&subscriptionOne, nil, func(dataValue []byte, errValue error) error {
+				if errValue == nil {
+					received.Add(1)
+				}
+				return nil
+			})
+			require.NoError(t, err)
+			require.NotEqual(t, "", subscriptionOneID)
+
+			clientRunErrCh := make(chan error)
+			go func() {
+				clientRunErrCh <- client.Run()
+			}()
+
+			xEnv.WaitForSubscriptionCount(1, EventWaitTimeout)
+			xEnv.WaitForTriggerCount(1, EventWaitTimeout)
+
+			// Publish the whole burst before flushing, so messages reach the router
+			// faster than a single event can be resolved and delivered.
+			for i := 0; i < messageCount; i++ {
+				err = xEnv.NatsConnectionDefault.Publish(xEnv.GetPubSubName("employeeUpdated.3"), []byte(`{"id":3,"__typename": "Employee"}`))
+				require.NoError(t, err)
+			}
+			require.NoError(t, xEnv.NatsConnectionDefault.Flush())
+
+			assert.Eventually(t, func() bool {
+				return received.Load() == messageCount
+			}, EventWaitTimeout, 50*time.Millisecond)
+			require.EqualValues(t, messageCount, received.Load(), "messages received by the subscription")
+
+			require.NoError(t, client.Close())
+			testenv.AwaitChannelWithT(t, EventWaitTimeout, clientRunErrCh, func(t *testing.T, err error) {
+				require.NoError(t, err)
+			}, "unable to close client before timeout")
 		})
 	})
 
